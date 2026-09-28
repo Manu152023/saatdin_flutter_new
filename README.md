@@ -72,11 +72,6 @@ Application API: Python 3.11, FastAPI, APScheduler | Billing: Java 17, Spring Bo
 - **[Setup Guide](setup%20guide.md)** — Local dev and deployment
 
 
----
-
-## Team
-
-T Vishnu Vardhan · D Rohith Kumar · V A B Jashwanth Reddy · V Kireeti · Tejesh Neelam
 
 ---
 
