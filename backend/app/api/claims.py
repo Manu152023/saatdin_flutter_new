@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status, Path
+
+from ..core.db import (
+    count_claims_for_phone_since,
+    count_settled_claim_days_for_phone_since,
+    create_claim,
+    list_claims_for_phone,
+    escalate_claim,
+    get_claim,
+)
+from ..core.dependencies import get_current_worker
+from ..core.zone_cache import resolve_zone
+from ..models.platform import Platform
+from ..models.schemas import ApiResponse, ClaimOut, ClaimSubmitRequest, ClaimEscalateRequest, ClaimEscalationOut
+from ..services.fraud_isolation import score_claim
+from ..services.gps_validation import evaluate_worker_gps_signal, gps_features_from_validation
+from ..services.motion_validation import evaluate_worker_motion_signal, motion_features_from_validation
+from ..services.premium import build_plans
+from ..services.coverage import has_active_coverage
+from ..services.tower_validation import evaluate_worker_tower_signal, tower_features_from_validation
+from ..services.trigger_monitor import calculate_zone_affinity_score, get_fraud_ring_members
+
+router = APIRouter(tags=["claims"])
+logger = logging.getLogger(__name__)
+
+_ALLOWED_CLAIM_TYPES = {
+    "rainlock": "RainLock",
+    "aqi_guard": "AQI Guard",
+    "aqiguard": "AQI Guard",
+    "trafficblock": "TrafficBlock",
+    "zonelock": "ZoneLock",
+    "heatblock": "HeatBlock",
+}
+
+_MANUAL_PAYOUT = {
+    "RainLock": 400.0,
+    "AQI Guard": 320.0,
+    "TrafficBlock": 280.0,
+    "ZoneLock": 400.0,
+    "HeatBlock": 240.0,
+}
+
+_TRIGGER_PAYOUT_FACTORS = {
+    "rain": 1.00,
+    "aqi": 0.80,
+    "traffic": 0.70,
+    "zonelock": 1.00,
+    "heat": 0.60,
+}
+
+
+def _claim_type_to_alert_key(claim_type: str) -> str:
+    normalized = claim_type.strip().lower().replace(" ", "").replace("_", "")
+    mapping = {
+        "rain": "rain",
+        "rainlock": "rain",
+        "aqi": "aqi",
+        "aqiguard": "aqi",
+        "traffic": "traffic",
+        "trafficblock": "traffic",
+        "zonelock": "zonelock",
+        "heat": "heat",
+        "heatblock": "heat",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _resolve_worker_plan(worker: dict) -> Optional[Any]:
+    try:
+        zone_pincode = str(worker.get("zone_pincode", ""))
+        _, zone_data = resolve_zone(zone_pincode)
+        zone_multiplier = float(zone_data.get("zone_risk_multiplier", 1.0))
+        platform = Platform.from_input(str(worker.get("platform_name", "swiggy_instamart")))
+        plans = build_plans(zone_multiplier, platform, zone_data=zone_data)
+        if not plans:
+            logger.warning(
+                "claim_plan_resolution_fallback_applied phone=%s reason=no_plans_returned zone=%s",
+                str(worker.get("phone", "unknown")),
+                zone_pincode,
+            )
+            return None
+        worker_plan_name = str(worker.get("plan_name", "")).strip().lower()
+        selected = next((plan for plan in plans if plan.name.lower() == worker_plan_name), None)
+        if selected is None:
+            fallback_plan = plans[1] if len(plans) > 1 else plans[0]
+            logger.warning(
+                "claim_plan_resolution_fallback_applied phone=%s requested_plan=%s fallback_plan=%s",
+                str(worker.get("phone", "unknown")),
+                worker_plan_name,
+                fallback_plan.name,
+            )
+        return selected if selected is not None else (plans[1] if len(plans) > 1 else plans[0])
+    except Exception as exc:
+        logger.warning(
+            "claim_plan_resolution_fallback_applied phone=%s reason=%s",
+            str(worker.get("phone", "unknown")),
+            str(exc),
+        )
+        return None
+
+
+def _current_week_start_utc(now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    week_start = now - timedelta(days=now.weekday())
+    return week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _manual_claim_amount_for_worker(worker: dict, claim_type: str, selected_plan: Optional[Any] = None) -> float:
+    fallback_amount = float(_MANUAL_PAYOUT.get(claim_type, 250.0))
+    try:
+        selected = selected_plan or _resolve_worker_plan(worker)
+        if selected is None:
+            return fallback_amount
+
+        factor = _TRIGGER_PAYOUT_FACTORS.get(_claim_type_to_alert_key(claim_type), 0.7)
+        return round(float(selected.perTriggerPayout) * factor, 2)
+    except Exception as exc:
+        logger.warning(
+            "manual_claim_amount_fallback phone=%s claim_type=%s reason=%s",
+            str(worker.get("phone", "unknown")),
+            claim_type,
+            str(exc),
+        )
+        return fallback_amount
+
+
+def _normalize_claim_type(raw: str) -> str:
+    key = raw.strip().lower().replace(" ", "").replace("_", "")
+    if key not in _ALLOWED_CLAIM_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown claim type: {raw}")
+    return _ALLOWED_CLAIM_TYPES[key]
+
+
+def _to_claim_out(row: dict) -> ClaimOut:
+    anomaly_features_raw = row.get("anomaly_features_json")
+    if isinstance(anomaly_features_raw, str):
+        try:
+            anomaly_features_raw = json.loads(anomaly_features_raw)
+        except json.JSONDecodeError:
+            anomaly_features_raw = None
+    anomaly_features = anomaly_features_raw if isinstance(anomaly_features_raw, dict) else None
+    anomaly_scored_at = row.get("anomaly_scored_at")
+    llm_decision_raw = row.get("llm_decision_json")
+    if isinstance(llm_decision_raw, str):
+        try:
+            llm_decision_raw = json.loads(llm_decision_raw)
+        except json.JSONDecodeError:
+            llm_decision_raw = None
+    llm_decision = llm_decision_raw if isinstance(llm_decision_raw, dict) else None
+
+    llm_attempts_raw = row.get("llm_attempts_json")
+    if isinstance(llm_attempts_raw, str):
+        try:
+            llm_attempts_raw = json.loads(llm_attempts_raw)
+        except json.JSONDecodeError:
+            llm_attempts_raw = None
+    llm_attempts = llm_attempts_raw if isinstance(llm_attempts_raw, list) else None
+    llm_scored_at = row.get("llm_scored_at")
+    tower_status = anomaly_features.get("tower_validation_status") if isinstance(anomaly_features, dict) else None
+    tower_confidence_raw = anomaly_features.get("tower_zone_confidence") if isinstance(anomaly_features, dict) else None
+    tower_reason = anomaly_features.get("tower_validation_reason") if isinstance(anomaly_features, dict) else None
+    tower_received_at = anomaly_features.get("tower_signal_received_at") if isinstance(anomaly_features, dict) else None
+    motion_status = anomaly_features.get("motion_validation_status") if isinstance(anomaly_features, dict) else None
+    motion_confidence_raw = anomaly_features.get("motion_confidence") if isinstance(anomaly_features, dict) else None
+    motion_reason = anomaly_features.get("motion_validation_reason") if isinstance(anomaly_features, dict) else None
+    motion_received_at = anomaly_features.get("motion_signal_received_at") if isinstance(anomaly_features, dict) else None
+
+    return ClaimOut(
+        id=f"#C{int(row['id']):05d}",
+        claimType=str(row["claim_type"]),
+        status=str(row["status"]),
+        amount=float(row["amount"]),
+        date=str(row["created_at"]),
+        description=str(row["description"]),
+        source=str(row["source"]),
+        anomalyScore=float(row["anomaly_score"]) if row.get("anomaly_score") is not None else None,
+        anomalyThreshold=float(row["anomaly_threshold"]) if row.get("anomaly_threshold") is not None else None,
+        anomalyFlagged=bool(row["anomaly_flagged"]) if row.get("anomaly_flagged") is not None else None,
+        anomalyModelVersion=str(row["anomaly_model_version"]) if row.get("anomaly_model_version") is not None else None,
+        anomalyScoredAt=str(anomaly_scored_at) if anomaly_scored_at is not None else None,
+        anomalyFeaturesJson=anomaly_features,
+        llmReviewUsed=bool(row["llm_review_used"]) if row.get("llm_review_used") is not None else None,
+        llmReviewStatus=str(row["llm_review_status"]) if row.get("llm_review_status") is not None else None,
+        llmProvider=str(row["llm_provider"]) if row.get("llm_provider") is not None else None,
+        llmModel=str(row["llm_model"]) if row.get("llm_model") is not None else None,
+        llmFallbackUsed=bool(row["llm_fallback_used"]) if row.get("llm_fallback_used") is not None else None,
+        llmDecisionConfidence=float(row["llm_decision_confidence"])
+        if row.get("llm_decision_confidence") is not None
+        else None,
+        llmDecisionJson=llm_decision,
+        llmAttemptsJson=llm_attempts,
+        llmValidationError=str(row["llm_validation_error"]) if row.get("llm_validation_error") is not None else None,
+        llmScoredAt=str(llm_scored_at) if llm_scored_at is not None else None,
+        towerValidationStatus=str(tower_status) if tower_status is not None else None,
+        towerZoneConfidence=float(tower_confidence_raw) if isinstance(tower_confidence_raw, (float, int)) else None,
+        towerValidationReason=str(tower_reason) if tower_reason is not None else None,
+        towerSignalReceivedAt=str(tower_received_at) if tower_received_at is not None else None,
+        motionValidationStatus=str(motion_status) if motion_status is not None else None,
+        motionConfidence=float(motion_confidence_raw) if isinstance(motion_confidence_raw, (float, int)) else None,
+        motionValidationReason=str(motion_reason) if motion_reason is not None else None,
+        motionSignalReceivedAt=str(motion_received_at) if motion_received_at is not None else None,
+    )
+
+
+async def _build_manual_claim_features(worker: dict, amount: float) -> dict:
+    phone = str(worker["phone"])
+    zone_pincode = str(worker["zone_pincode"])
+    _, zone_data = resolve_zone(zone_pincode)
+
+    coords = zone_data.get("coordinates_approx", {})
+    zone_lat = float(zone_data.get("latitude", coords.get("lat", 12.97)))
+    zone_lon = float(zone_data.get("longitude", coords.get("lon", 77.59)))
+    zone_affinity = await calculate_zone_affinity_score(phone, zone_lat, zone_lon)
+    fraud_ring_size = len(get_fraud_ring_members(phone))
+    recent_claims_24h = await count_claims_for_phone_since(
+        phone,
+        datetime.now(timezone.utc) - timedelta(hours=24),
+    )
+    tower_validation = await evaluate_worker_tower_signal(
+        phone=phone,
+        claimed_zone_pincode=zone_pincode,
+        zone_lat=zone_lat,
+        zone_lon=zone_lon,
+    )
+    motion_validation = await evaluate_worker_motion_signal(phone=phone)
+    gps_validation = await evaluate_worker_gps_signal(phone=phone)
+
+    features = {
+        "zone_affinity_score": zone_affinity,
+        "fraud_ring_size": float(fraud_ring_size),
+        "recent_claims_24h": float(recent_claims_24h),
+        "claim_amount": float(amount),
+        "trigger_confidence": 0.55,
+        "is_manual_source": 1.0,
+        "is_auto_source": 0.0,
+        "flood_risk_score": float(zone_data.get("flood_risk_score", 0.5)),
+        "aqi_risk_score": float(zone_data.get("aqi_risk_score", 0.5)),
+        "traffic_congestion_score": float(zone_data.get("traffic_congestion_score", 0.5)),
+    }
+    features.update(tower_features_from_validation(tower_validation))
+    features.update(motion_features_from_validation(motion_validation))
+    features.update(gps_features_from_validation(gps_validation))
+    return features
+
+
+@router.get("", response_model=ApiResponse)
+async def get_my_claims(worker: dict = Depends(get_current_worker)) -> ApiResponse:
+    rows = await list_claims_for_phone(str(worker["phone"]))
+    items = [_to_claim_out(row) for row in rows]
+    logger.info("claims_list_requested phone=%s count=%s", worker["phone"], len(items))
+    return ApiResponse(success=True, data=items)
+
+
+@router.post("/submit", response_model=ApiResponse, status_code=status.HTTP_201_CREATED)
+async def submit_claim(payload: ClaimSubmitRequest, worker: dict = Depends(get_current_worker)) -> ApiResponse:
+    claim_type = _normalize_claim_type(payload.claimType)
+    phone = str(worker["phone"])
+    if not await has_active_coverage(phone):
+        raise HTTPException(
+            status_code=409,
+            detail="An active policy is required to submit a claim.",
+        )
+    selected_plan = _resolve_worker_plan(worker)
+    max_days_per_week = max(1, int(getattr(selected_plan, "maxDaysPerWeek", 1)))
+    settled_days_this_week = await count_settled_claim_days_for_phone_since(
+        phone,
+        _current_week_start_utc(),
+    )
+    if settled_days_this_week >= max_days_per_week:
+        active_plan_name = str(getattr(selected_plan, "name", worker.get("plan_name", "Current")))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Weekly coverage cap reached for plan {active_plan_name} "
+                f"({max_days_per_week} covered days/week)."
+            ),
+        )
+
+    amount = _manual_claim_amount_for_worker(worker, claim_type, selected_plan=selected_plan)
+    anomaly_features = await _build_manual_claim_features(worker, amount)
+    anomaly = score_claim(
+        anomaly_features,
+        context={
+            "phone": phone,
+            "claim_type": claim_type,
+            "source": "manual",
+        },
+    )
+
+    row = await create_claim(
+        phone=phone,
+        claim_type=claim_type,
+        status="in_review",
+        amount=amount,
+        description=payload.description.strip(),
+        zone_pincode=str(worker["zone_pincode"]),
+        source="manual",
+        anomaly_score=float(anomaly["anomaly_score"]),
+        anomaly_threshold=float(anomaly["anomaly_threshold"]),
+        anomaly_flagged=bool(anomaly["anomaly_flagged"]),
+        anomaly_model_version=str(anomaly["anomaly_model_version"]),
+        anomaly_features=dict(anomaly["anomaly_features"]),
+        anomaly_scored_at=str(anomaly["anomaly_scored_at"]),
+        llm_review_used=bool(anomaly["llm_review_used"]) if anomaly.get("llm_review_used") is not None else None,
+        llm_review_status=str(anomaly["llm_review_status"]) if anomaly.get("llm_review_status") is not None else None,
+        llm_provider=str(anomaly["llm_provider"]) if anomaly.get("llm_provider") is not None else None,
+        llm_model=str(anomaly["llm_model"]) if anomaly.get("llm_model") is not None else None,
+        llm_fallback_used=bool(anomaly["llm_fallback_used"]) if anomaly.get("llm_fallback_used") is not None else None,
+        llm_decision_confidence=float(anomaly["llm_decision_confidence"])
+        if anomaly.get("llm_decision_confidence") is not None
+        else None,
+        llm_decision_json=anomaly.get("llm_decision_json"),
+        llm_attempts=anomaly.get("llm_attempts"),
+        llm_validation_error=str(anomaly["llm_validation_error"])
+        if anomaly.get("llm_validation_error") is not None
+        else None,
+        llm_scored_at=str(anomaly["llm_scored_at"]) if anomaly.get("llm_scored_at") is not None else None,
+    )
+    out = _to_claim_out(row)
+    logger.info(
+        "claim_submitted phone=%s claim_id=%s claim_type=%s anomaly_score=%.6f anomaly_flagged=%s",
+        phone,
+        out.id,
+        claim_type,
+        float(anomaly["anomaly_score"]),
+        bool(anomaly["anomaly_flagged"]),
+    )
+
+    return ApiResponse(
+        success=True,
+        data=out,
+        message="Claim submitted for review",
+    )
+
+
+@router.post("/{claim_id}/escalate", response_model=ApiResponse, status_code=status.HTTP_201_CREATED)
+async def escalate_claim_endpoint(
+    claim_id: int = Path(..., ge=1),
+    payload: ClaimEscalateRequest = None,
+    worker: dict = Depends(get_current_worker),
+) -> ApiResponse:
+    """
+    Worker escalates a claim for manual review (e.g., disputes auto-settlement).
+    Claim is marked and queued for human review with target SLA of 2 hours.
+    """
+    if payload is None:
+        raise HTTPException(status_code=400, detail="Escalation reason required")
+
+    phone = str(worker["phone"])
+    claim = await get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(status_code=404, detail=f"Claim {claim_id} not found")
+    if str(claim.get("phone")) != phone:
+        raise HTTPException(status_code=403, detail="Claim does not belong to requesting worker")
+
+    escalation = await escalate_claim(
+        claim_id=claim_id,
+        phone=phone,
+        reason=payload.reason.strip(),
+    )
+
+    logger.info(
+        f"claim_escalated claim_id={claim_id} phone={phone} reason={payload.reason[:50]}..."
+    )
+
+    return ApiResponse(
+        success=True,
+        data=ClaimEscalationOut(
+            id=escalation["id"],
+            claimId=escalation["claim_id"],
+            phone=escalation["phone"],
+            reason=escalation["reason"],
+            status=escalation["status"],
+            reviewNotes=None,
+            createdAt=escalation["created_at"],
+        ),
+        message="Claim escalated for manual review. Review SLA: 2 hours.",
+    )

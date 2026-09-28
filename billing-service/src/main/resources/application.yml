@@ -1,0 +1,39 @@
+server:
+  port: 8082
+
+billing:
+  internal-api-key: ${BILLING_INTERNAL_API_KEY:development-internal-key}
+  provider: ${BILLING_PROVIDER:sandbox}
+  sandbox-webhook-secret: ${BILLING_SANDBOX_WEBHOOK_SECRET:development-sandbox-secret}
+  coverage-max-batch-size: ${BILLING_COVERAGE_MAX_BATCH_SIZE:100}
+  app-environment: ${APP_ENVIRONMENT:development}
+
+spring:
+  application:
+    name: billing-service
+  datasource:
+    url: ${BILLING_DB_URL:}
+    username: ${BILLING_DB_USERNAME:}
+    password: ${BILLING_DB_PASSWORD:}
+  flyway:
+    enabled: true
+    create-schemas: true
+    schemas: billing
+    default-schema: billing
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: billing
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true

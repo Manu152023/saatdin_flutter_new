@@ -1,0 +1,1028 @@
+import 'package:flutter/material.dart';
+import 'dart:math' as math;
+
+import '../../theme/app_colors.dart';
+import '../../models/claim_model.dart';
+import '../../models/user_model.dart';
+import '../../services/api_service.dart';
+import '../../widgets/claim_card.dart';
+import '../../services/tab_router.dart';
+import 'zone_lock_report_screen.dart';
+import 'escalation_screen.dart';
+
+class ClaimsScreen extends StatefulWidget {
+  const ClaimsScreen({super.key});
+
+  @override
+  State<ClaimsScreen> createState() => _ClaimsScreenState();
+}
+
+class _ClaimsScreenState extends State<ClaimsScreen> {
+  final ApiService _apiService = ApiService();
+  int _selectedTab = 0;
+  final _tabs = ['All Claims', 'In Review', 'Settled'];
+  List<Claim> _claims = [];
+  User? _user;
+  Map<String, dynamic>? _policy;
+  bool _isLoadingClaims = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadClaims();
+  }
+
+  Future<void> _loadClaims() async {
+    setState(() {
+      _isLoadingClaims = true;
+    });
+
+    User? user;
+    Map<String, dynamic>? policy;
+    List<Claim> claims = const <Claim>[];
+    final loadIssues = <String>[];
+
+    try {
+      try {
+        user = await _apiService.getProfile('me');
+      } catch (error) {
+        if (!_isAuthRelatedError(error)) {
+          loadIssues.add('profile');
+        }
+      }
+
+      try {
+        policy = await _apiService.getPolicy('me');
+      } catch (error) {
+        if (!_isAuthRelatedError(error)) {
+          loadIssues.add('policy');
+        }
+        policy = <String, dynamic>{};
+      }
+
+      try {
+        claims = await _apiService.getClaims('me');
+      } catch (error) {
+        if (!_isAuthRelatedError(error)) {
+          loadIssues.add('claims');
+        }
+        claims = const <Claim>[];
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _user = user ?? const User.empty();
+        _policy = policy ?? <String, dynamic>{};
+        _claims = claims;
+      });
+
+      if (loadIssues.isNotEmpty) {
+        final issueText = switch (loadIssues.first) {
+          'profile' => 'Could not load profile details.',
+          'policy' => 'Could not load policy details.',
+          'claims' => 'Could not load claim history.',
+          _ => 'Could not refresh claim details.',
+        };
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              loadIssues.length == 1
+                  ? issueText
+                  : 'Some claim details could not be refreshed.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoadingClaims = false;
+        });
+      }
+    }
+  }
+
+  bool _isAuthRelatedError(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('authentication required') ||
+        message.contains('not authenticated') ||
+        message.contains('unauthorized') ||
+        message.contains('token') ||
+        message.contains('worker not found for token subject');
+  }
+
+  Widget _buildTopUtilityButtons(User user) {
+    final safeName = _coerceString(user.name, fallback: 'U');
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        _utilityIconButton(
+          icon: Icons.arrow_back,
+          tooltip: 'Back to Home',
+          onTap: () {
+            _switchToTab(0);
+          },
+        ),
+        Row(
+          children: [
+            _utilityIconButton(
+              icon: Icons.notifications_none,
+              tooltip: 'Notifications',
+              onTap: () {
+                _showNotificationsSheet();
+              },
+            ),
+            const SizedBox(width: 10),
+            Tooltip(
+              message: 'Account',
+              child: GestureDetector(
+                onTap: () {
+                  _showAccountSheet(user);
+                },
+                child: Container(
+                  width: 42,
+                  height: 42,
+                  decoration: const BoxDecoration(
+                    color: AppColors.primary,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Center(
+                    child: Text(
+                      _userInitials(safeName),
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _utilityIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.2),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.28)),
+          ),
+          child: Icon(icon, size: 21, color: AppColors.textPrimary),
+        ),
+      ),
+    );
+  }
+
+  List<Claim> get _filteredClaims {
+    switch (_selectedTab) {
+      case 1:
+        return _claims
+            .where(
+              (c) =>
+                  c.status == ClaimStatus.inReview ||
+                  c.status == ClaimStatus.escalated,
+            )
+            .toList();
+      case 2:
+        return _claims.where((c) => c.status == ClaimStatus.settled).toList();
+      default:
+        return _claims;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = _user;
+    final weeklyPremium = (_policy?['weeklyPremium'] as num? ?? 0).toInt();
+    final policyStatus = ((_policy?['status'] as String?) ?? 'active')
+        .toUpperCase();
+    final inReviewCount = _claims
+        .where(
+          (c) =>
+              c.status == ClaimStatus.inReview ||
+              c.status == ClaimStatus.escalated,
+        )
+        .length;
+
+    if (_isLoadingClaims) {
+      return const Scaffold(
+        backgroundColor: AppColors.scaffoldBackground,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (user == null) {
+      return const Scaffold(
+        backgroundColor: AppColors.scaffoldBackground,
+        body: Center(
+          child: Text(
+            'Failed to load claims data.',
+            style: TextStyle(color: AppColors.textSecondary),
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      backgroundColor: AppColors.scaffoldBackground,
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ZoneLock quick-report button (Issue #8)
+          Tooltip(
+            message: 'Report ZoneLock',
+            child: FloatingActionButton.small(
+              heroTag: 'fab_zonelock',
+              onPressed: _openZoneLockReport,
+              backgroundColor: AppColors.warning,
+              child: const Icon(
+                Icons.lock_person_outlined,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          FloatingActionButton(
+            heroTag: 'fab_new_claim',
+            onPressed: () {
+              _showNewClaimSheet();
+            },
+            backgroundColor: AppColors.primary,
+            child: const Icon(Icons.add, color: Colors.white),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          const Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SizedBox(
+              height: 205,
+              child: CustomPaint(painter: _ClaimsTopBackgroundPainter()),
+            ),
+          ),
+          SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 16),
+
+                  _buildTopUtilityButtons(user),
+                  const SizedBox(height: 14),
+
+                  // Header
+                  const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Claims',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          color: AppColors.textPrimary,
+                          letterSpacing: -0.4,
+                        ),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Track status and settlements',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: AppColors.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+
+                  // Current protection header
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: AppColors.primary,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'CURRENT PROTECTION',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white.withValues(alpha: 0.6),
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              '₹$weeklyPremium',
+                              style: TextStyle(
+                                fontSize: 36,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
+                                letterSpacing: -0.5,
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: AppColors.success,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                policyStatus,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  letterSpacing: 0.8,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '$inReviewCount pending settlements',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.white.withValues(alpha: 0.6),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+
+                  const Text(
+                    'Filter',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Filter tabs
+                  Row(
+                    children: _tabs.asMap().entries.map((entry) {
+                      final isSelected = _selectedTab == entry.key;
+                      return Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              _selectedTab = entry.key;
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isSelected
+                                  ? AppColors.primary
+                                  : AppColors.surfaceLight,
+                              borderRadius: BorderRadius.circular(24),
+                            ),
+                            child: Text(
+                              entry.value,
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: isSelected
+                                    ? Colors.white
+                                    : AppColors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 20),
+
+                  const Text(
+                    'Recent Activity',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Claims list
+                  if (_isLoadingClaims)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 24),
+                      child: Center(child: CircularProgressIndicator()),
+                    )
+                  else if (_filteredClaims.isEmpty)
+                    Center(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 40),
+                        child: Column(
+                          children: [
+                            const Icon(
+                              Icons.receipt_long_outlined,
+                              size: 48,
+                              color: AppColors.textTertiary,
+                            ),
+                            const SizedBox(height: 12),
+                            const Text(
+                              'No claims in this category',
+                              style: TextStyle(
+                                fontSize: 15,
+                                color: AppColors.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  for (final claim in _filteredClaims)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: ClaimCard(
+                        claim: claim,
+                        onTap: () => _showClaimDetails(claim),
+                      ),
+                    ),
+
+                  const SizedBox(height: 16),
+
+                  // Need help section
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: AppColors.cardBackground,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Need help with a claim?',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Our claim specialists are available 24/7 to assist you in Kannada, Hindi, and English.',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: AppColors.textSecondary,
+                            height: 1.4,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _coerceString(Object? value, {String fallback = ''}) {
+    if (value == null) return fallback;
+    final text = value.toString().trim();
+    return text.isEmpty ? fallback : text;
+  }
+
+  String _userInitials(String? name) {
+    final safeName = _coerceString(name);
+    final parts = safeName
+        .trim()
+        .split(' ')
+        .where((p) => p.isNotEmpty)
+        .toList();
+    if (parts.isEmpty) return 'U';
+    if (parts.length == 1) return parts.first.substring(0, 1).toUpperCase();
+    return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
+  }
+
+  void _openProfile() {
+    _switchToTab(4);
+  }
+
+  void _switchToTab(int index) {
+    TabRouter.switchTo(index);
+    Navigator.of(context).popUntil((route) => route.isFirst);
+  }
+
+  void _showNotificationsSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (_) {
+        return ListView(
+          shrinkWrap: true,
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+          children: const [
+            ListTile(
+              leading: Icon(Icons.update_outlined),
+              title: Text('Claim #17210 moved to review'),
+              subtitle: Text('Our team requested one additional proof image'),
+            ),
+            ListTile(
+              leading: Icon(Icons.account_balance_wallet_outlined),
+              title: Text('Settlement complete for #17209'),
+              subtitle: Text('Rs 1,450 transferred to your linked bank'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showAccountSheet(User user) {
+    final safeName = _coerceString(user.name, fallback: 'User');
+    final safePhone = _coerceString(user.phone, fallback: 'No phone');
+
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: AppColors.primary,
+                  child: Text(
+                    _userInitials(safeName),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                title: Text(safeName),
+                subtitle: Text(safePhone),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _openProfile();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.home_outlined),
+                title: const Text('Home'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _switchToTab(0);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.receipt_long_outlined),
+                title: const Text('Claims'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _switchToTab(1);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.shield_outlined),
+                title: const Text('Coverage details'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _switchToTab(2);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.payments_outlined),
+                title: const Text('Payouts'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _switchToTab(3);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showNewClaimSheet() async {
+    String selectedType = 'TrafficBlock';
+    final descriptionController = TextEditingController();
+
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        showDragHandle: true,
+        builder: (sheetContext) {
+          return StatefulBuilder(
+            builder: (sheetContext, setSheetState) {
+              return Padding(
+                padding: EdgeInsets.fromLTRB(
+                  16,
+                  8,
+                  16,
+                  math.max(0.0, MediaQuery.of(sheetContext).viewInsets.bottom) +
+                      16,
+                ),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+                  ),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Report a new claim',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Trigger type',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children:
+                              [
+                                'TrafficBlock',
+                                'RainLock',
+                                'AQI Guard',
+                                'ZoneLock',
+                                'HeatBlock',
+                              ].map((type) {
+                                final isSelected = selectedType == type;
+                                return ChoiceChip(
+                                  label: Text(type),
+                                  selected: isSelected,
+                                  onSelected: (_) {
+                                    setSheetState(() {
+                                      selectedType = type;
+                                    });
+                                  },
+                                );
+                              }).toList(),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: descriptionController,
+                          maxLines: 3,
+                          decoration: const InputDecoration(
+                            labelText: 'What happened?',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: () async {
+                              final messenger = ScaffoldMessenger.of(context);
+                              final navigator = Navigator.of(sheetContext);
+                              final desc =
+                                  descriptionController.text.trim().isEmpty
+                                  ? 'No additional details provided'
+                                  : descriptionController.text.trim();
+                              ClaimType claimType = ClaimType.trafficBlock;
+                              if (selectedType == 'RainLock') {
+                                claimType = ClaimType.rainLock;
+                              }
+                              if (selectedType == 'AQI Guard') {
+                                claimType = ClaimType.aqiGuard;
+                              }
+                              if (selectedType == 'ZoneLock') {
+                                claimType = ClaimType.zoneLock;
+                              }
+                              if (selectedType == 'HeatBlock') {
+                                claimType = ClaimType.heatBlock;
+                              }
+
+                              try {
+                                await _apiService.submitClaim(
+                                  userId: 'me',
+                                  type: claimType,
+                                  description: desc,
+                                );
+                                if (!context.mounted) return;
+                                navigator.pop();
+                                await _loadClaims();
+                              } catch (_) {
+                                if (!context.mounted) return;
+                                messenger.showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'Claim submission failed. Please try again.',
+                                    ),
+                                  ),
+                                );
+                                return;
+                              }
+
+                              if (!context.mounted) return;
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Claim submitted: $selectedType · $desc',
+                                  ),
+                                ),
+                              );
+                            },
+                            child: const Text('Submit claim'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      descriptionController.dispose();
+    }
+  }
+
+  void _showClaimDetails(Claim claim) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetCtx) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Claim header
+              Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: AppColors.accentLight,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(
+                      Icons.receipt_long_outlined,
+                      color: AppColors.primary,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Claim ${claim.id}',
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                          color: AppColors.textPrimary,
+                        ),
+                      ),
+                      Text(
+                        '${claim.typeShortName} · ${claim.statusLabel}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: AppColors.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Details row
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: AppColors.surfaceLight,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: [
+                    _DetailItem(
+                      label: 'Amount',
+                      value: 'Rs ${claim.amount.toStringAsFixed(0)}',
+                    ),
+                    const VerticalDivider(width: 32),
+                    _DetailItem(label: 'Status', value: claim.statusLabel),
+                    const VerticalDivider(width: 32),
+                    _DetailItem(label: 'Type', value: claim.typeShortName),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'Our reviewer will update this timeline as soon as verification completes.',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 20),
+              // Escalate button (Issue #9)
+              if (claim.status == ClaimStatus.inReview ||
+                  claim.status == ClaimStatus.escalated ||
+                  claim.status == ClaimStatus.pending)
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(
+                      Icons.escalator_warning_rounded,
+                      color: AppColors.error,
+                      size: 18,
+                    ),
+                    label: const Text(
+                      'Escalate this claim',
+                      style: TextStyle(
+                        color: AppColors.error,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    onPressed: () async {
+                      Navigator.of(sheetCtx).pop();
+                      final submitted = await EscalationSheet.show(
+                        context,
+                        claim,
+                      );
+                      if (submitted == true && mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Escalation submitted. A reviewer will contact you within 2 hrs.',
+                            ),
+                          ),
+                        );
+                        await _loadClaims();
+                      }
+                    },
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: AppColors.error),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _openZoneLockReport() async {
+    final submitted = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(builder: (_) => const ZoneLockReportScreen()),
+    );
+    if (submitted == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('ZoneLock report submitted successfully!'),
+        ),
+      );
+      await _loadClaims();
+    }
+  }
+}
+
+// Helper widget for claim detail row items
+class _DetailItem extends StatelessWidget {
+  const _DetailItem({required this.label, required this.value});
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              fontSize: 11,
+              color: AppColors.textTertiary,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              color: AppColors.textPrimary,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ClaimsTopBackgroundPainter extends CustomPainter {
+  const _ClaimsTopBackgroundPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final backgroundPaint = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Color(0xFFE7F2FF), Color(0xFFF0F8FF), Color(0xFFF8FBFF)],
+      ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
+
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.width, size.height),
+      backgroundPaint,
+    );
+
+    final shapePaint = Paint()..color = AppColors.info.withValues(alpha: 0.12);
+    final shapePath = Path()
+      ..moveTo(-20, size.height * 0.74)
+      ..lineTo(size.width * 0.42, size.height * 0.56)
+      ..lineTo(size.width + 30, size.height * 0.84)
+      ..lineTo(size.width + 30, size.height)
+      ..lineTo(-20, size.height)
+      ..close();
+    canvas.drawPath(shapePath, shapePaint);
+
+    final ringPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..color = AppColors.info.withValues(alpha: 0.15);
+
+    canvas.drawCircle(
+      Offset(size.width * 0.18, size.height * 0.2),
+      32,
+      ringPaint,
+    );
+    canvas.drawCircle(
+      Offset(size.width * 0.86, size.height * 0.3),
+      48,
+      ringPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
